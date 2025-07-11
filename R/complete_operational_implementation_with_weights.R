@@ -1,6 +1,6 @@
-# R/complete_operational_implementation_with_adjusted_returns.R
-# COMPLETE OPERATIONAL IMPLEMENTATION WITH ADJUSTED RETURNS
-# Updated to use adjClose for dividend-adjusted returns instead of close returns
+# R/complete_operational_implementation_with_weights.R
+# COMPLETE CORRECTED OPERATIONAL IMPLEMENTATION WITH DAILY AGGREGATE WEIGHTS
+# Direct implementation of Full Technical Bridge logic for production with weight tracking
 
 library(tidyverse)
 library(lubridate)
@@ -12,12 +12,12 @@ library(TTR)
 library(arrow)  # For parquet export
 
 cat("====================================================================\n")
-cat("COMPLETE OPERATIONAL IMPLEMENTATION WITH ADJUSTED RETURNS\n")
-cat("Production-ready implementation using adjClose for dividend-adjusted returns\n")
+cat("COMPLETE OPERATIONAL IMPLEMENTATION WITH DAILY AGGREGATE WEIGHTS\n")
+cat("Production-ready implementation with systematic weight tracking\n")
 cat("====================================================================\n\n")
 
 # ============================================================================
-# AGGREGATE WEIGHTS CALCULATION FUNCTION (UNCHANGED)
+# AGGREGATE WEIGHTS CALCULATION FUNCTION
 # ============================================================================
 
 calculate_aggregate_weights <- function(slice_values, slice_holdings, current_date) {
@@ -89,7 +89,7 @@ calculate_aggregate_weights <- function(slice_values, slice_holdings, current_da
 }
 
 # ============================================================================
-# ENHANCED EXPORT WITH ADJUSTED RETURNS VALIDATION
+# EXPORT WEIGHTS AND VALIDATION DATA FUNCTION
 # ============================================================================
 
 export_daily_aggregate_weights <- function(daily_aggregate_weights, output_dir = "output", export_validation_data = TRUE) {
@@ -138,33 +138,25 @@ export_daily_aggregate_weights <- function(daily_aggregate_weights, output_dir =
   complete_file <- file.path(output_dir, "complete_aggregate_weights_timeseries.csv")
   write_csv(daily_aggregate_weights, complete_file)
   
-  # NEW: Export validation data WITH ADJUSTED RETURNS as parquet if requested
+  # NEW: Export validation data as parquet if requested
   validation_parquet_file <- NULL
-  adjusted_validation_file <- NULL
   if(export_validation_data) {
-    # Generate validation data with BOTH close and adjusted returns
-    validation_data <- generate_validation_data_with_adjusted_returns(daily_aggregate_weights)
+    # Generate validation data on-the-fly for export
+    validation_data <- generate_validation_data_for_export(daily_aggregate_weights)
     
     if(!is.null(validation_data) && nrow(validation_data) > 0) {
       validation_parquet_file <- file.path(output_dir, "weights_with_returns_validation.parquet")
-      adjusted_validation_file <- file.path(output_dir, "weights_with_adjusted_returns_validation.parquet")
       
-      # Export validation data with close returns (for compatibility)
+      # Export selected columns as parquet
       validation_export <- validation_data %>%
         select(return_date, ticker, aggregate_weight, daily_return)
+      
       write_parquet(validation_export, validation_parquet_file)
       
-      # Export enhanced validation data with ONLY adjusted returns (keeping same column name)
-      enhanced_validation_export <- validation_data %>%
-        mutate(daily_return = adjusted_return) %>%  # Replace daily_return with adjusted_return
-        select(return_date, ticker, aggregate_weight, daily_return)
-      write_parquet(enhanced_validation_export, adjusted_validation_file)
-      
       cat("📦 Exported validation data:\n")
-      cat("• Close returns parquet:     ", validation_parquet_file, "\n")
-      cat("• Adjusted returns parquet:  ", adjusted_validation_file, "(using adjusted returns as daily_return)\n")
-      cat("• Validation observations:   ", nrow(validation_export), "\n")
-      cat("• Date range:                ", as.character(range(validation_export$return_date)), "\n")
+      cat("• Parquet file:", validation_parquet_file, "\n")
+      cat("• Validation observations:", nrow(validation_export), "\n")
+      cat("• Date range:", as.character(range(validation_export$return_date)), "\n")
     }
   }
   
@@ -181,18 +173,17 @@ export_daily_aggregate_weights <- function(daily_aggregate_weights, output_dir =
     summary_file = summary_file,
     complete_file = complete_file,
     validation_parquet_file = validation_parquet_file,
-    adjusted_validation_file = adjusted_validation_file,
     portfolio_summary = portfolio_summary
   ))
 }
 
 # ============================================================================
-# ENHANCED VALIDATION DATA WITH ADJUSTED RETURNS
+# VALIDATION DATA GENERATION FOR EXPORT
 # ============================================================================
 
-generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weights, db_path = "data/dev.duckdb") {
+generate_validation_data_for_export <- function(daily_aggregate_weights, db_path = "data/dev.duckdb") {
   
-  cat("🔗 Generating validation data with adjusted returns...\n")
+  cat("🔗 Generating validation data for export...\n")
   
   if(nrow(daily_aggregate_weights) == 0) {
     return(NULL)
@@ -204,9 +195,9 @@ generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weigh
   # Find price table
   price_table <- "results_pricedata.daily"
   
-  # Test if table exists and has adjClose column
+  # Test if table exists
   table_exists <- tryCatch({
-    test_query <- sprintf("SELECT COUNT(*) as count FROM %s WHERE adjClose IS NOT NULL LIMIT 1", price_table)
+    test_query <- sprintf("SELECT COUNT(*) as count FROM %s LIMIT 1", price_table)
     result <- dbGetQuery(con, test_query)
     TRUE
   }, error = function(e) {
@@ -218,7 +209,7 @@ generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weigh
     possible_names <- c("results_pricedata_daily", "pricedata", "daily_prices", "price_data")
     for(name in possible_names) {
       table_exists <- tryCatch({
-        test_query <- sprintf("SELECT COUNT(*) as count FROM %s WHERE adjClose IS NOT NULL LIMIT 1", name)
+        test_query <- sprintf("SELECT COUNT(*) as count FROM %s LIMIT 1", name)
         result <- dbGetQuery(con, test_query)
         price_table <- name
         TRUE
@@ -230,12 +221,10 @@ generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weigh
   }
   
   if(!table_exists) {
-    cat("❌ No valid price table with adjClose found for validation data export\n")
+    cat("❌ No valid price table found for validation data export\n")
     dbDisconnect(con)
     return(NULL)
   }
-  
-  cat("✅ Found table with adjClose:", price_table, "\n")
   
   # Get unique dates from weights (these are the T-1 dates)
   weight_dates <- sort(unique(daily_aggregate_weights$date))
@@ -247,7 +236,7 @@ generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weigh
     SELECT DISTINCT date 
     FROM %s 
     WHERE date >= '%s' AND date <= '%s'
-      AND close IS NOT NULL AND adjClose IS NOT NULL
+      AND close IS NOT NULL
     ORDER BY date
   ", price_table, min_date, max_date + days(30))  # Extra buffer for next trading days
   
@@ -266,114 +255,58 @@ generate_validation_data_with_adjusted_returns <- function(daily_aggregate_weigh
     }
   }
   
-  # Get both close and adjusted returns for all return dates
+  # Get daily returns for all return dates
   return_dates <- unique(date_mapping$return_date)
   min_return_date <- min(return_dates)
   max_return_date <- max(return_dates)
   
-  # Calculate BOTH close and adjusted returns
+  # Calculate daily returns
   returns_query <- sprintf("
     WITH price_data AS (
-      SELECT ticker, date, close, adjClose
+      SELECT ticker, date, close
       FROM %s 
       WHERE date >= '%s' AND date <= '%s'
-        AND close IS NOT NULL AND adjClose IS NOT NULL 
-        AND close > 0 AND adjClose > 0
+        AND close IS NOT NULL AND close > 0
       ORDER BY ticker, date
     ),
     returns_calc AS (
       SELECT 
         curr.ticker,
         curr.date as return_date,
-        -- Close-to-close returns (original method)
-        curr.close / LAG(curr.close) OVER (PARTITION BY curr.ticker ORDER BY curr.date) - 1 as daily_return,
-        -- Adjusted close returns (dividend-adjusted)
-        curr.adjClose / LAG(curr.adjClose) OVER (PARTITION BY curr.ticker ORDER BY curr.date) - 1 as adjusted_return
+        curr.close / LAG(curr.close) OVER (PARTITION BY curr.ticker ORDER BY curr.date) - 1 as daily_return
       FROM price_data curr
     )
-    SELECT 
-      ticker, return_date, 
-      daily_return, adjusted_return,
-      adjusted_return - daily_return as return_difference
+    SELECT ticker, return_date, daily_return
     FROM returns_calc
-    WHERE daily_return IS NOT NULL AND adjusted_return IS NOT NULL
+    WHERE daily_return IS NOT NULL
       AND return_date >= '%s' AND return_date <= '%s'
   ", price_table, min_return_date - days(5), max_return_date, min_return_date, max_return_date)
   
-  both_returns <- dbGetQuery(con, returns_query) %>%
+  daily_returns <- dbGetQuery(con, returns_query) %>%
     mutate(return_date = as.Date(return_date))
   
   dbDisconnect(con)
   
-  # Join weights with date mapping and both return types
+  # Join weights with date mapping and returns
   weights_with_returns <- daily_aggregate_weights %>%
     mutate(weight_date = as.Date(date)) %>%
     left_join(date_mapping, by = "weight_date") %>%
-    left_join(both_returns, by = c("ticker", "return_date")) %>%
+    left_join(daily_returns, by = c("ticker", "return_date")) %>%
     filter(!is.na(return_date)) %>%
-    select(date, return_date, ticker, aggregate_weight, daily_return, adjusted_return, return_difference)
+    select(date, return_date, ticker, aggregate_weight, daily_return)
   
-  cat("✅ Generated validation data with both return types\n")
-  cat("• Total observations:", nrow(weights_with_returns), "\n")
-  cat("• Has close returns: ", sum(!is.na(weights_with_returns$daily_return)), "\n")
-  cat("• Has adjusted returns:", sum(!is.na(weights_with_returns$adjusted_return)), "\n")
+  cat("✅ Generated validation data with", nrow(weights_with_returns), "observations\n")
   
   return(weights_with_returns)
 }
 
 # ============================================================================
-# UPDATED DAILY RETURNS FUNCTION - NOW USES ADJUSTED RETURNS
-# ============================================================================
-
-get_daily_stock_returns_adjusted <- function(current_date, con, price_table) {
-  
-  cat("📊 Getting ADJUSTED returns for", as.character(current_date), "\n")
-  
-  # Get previous trading day
-  prev_date_query <- sprintf("
-    SELECT MAX(date) as prev_date 
-    FROM %s 
-    WHERE date < '%s' AND adjClose IS NOT NULL
-  ", price_table, current_date)
-  
-  prev_date <- dbGetQuery(con, prev_date_query)$prev_date[1]
-  
-  if(is.na(prev_date)) {
-    return(tibble(ticker = character(0), daily_return = numeric(0)))
-  }
-  
-  # Calculate ADJUSTED daily returns (using adjClose instead of close)
-  returns_query <- sprintf("
-    SELECT 
-      curr.ticker,
-      curr.adjClose / prev.adjClose - 1 as daily_return
-    FROM 
-      (SELECT ticker, adjClose FROM %s WHERE date = '%s' AND adjClose IS NOT NULL) curr
-    INNER JOIN 
-      (SELECT ticker, adjClose FROM %s WHERE date = '%s' AND adjClose IS NOT NULL) prev
-    ON curr.ticker = prev.ticker
-    WHERE curr.adjClose IS NOT NULL AND prev.adjClose IS NOT NULL
-      AND prev.adjClose > 0
-  ", price_table, current_date, price_table, prev_date)
-  
-  daily_returns <- dbGetQuery(con, returns_query) %>%
-    select(ticker, daily_return)
-  
-  cat("✅ Retrieved", nrow(daily_returns), "adjusted returns\n")
-  
-  return(daily_returns)
-}
-
-# ============================================================================
-# COMPLETE TECHNICAL FACTORS CALCULATION (UNCHANGED - USES CLOSE FOR SIGNALS)
+# COMPLETE TECHNICAL FACTORS CALCULATION (ALL 58 FACTORS)
 # ============================================================================
 
 calculate_complete_technical_factors <- function(price_data, current_date) {
   
   cat("🔧 Calculating 58 technical factors for", as.character(current_date), "\n")
-  
-  # NOTE: Technical factors still use close prices for signal generation
-  # Only the portfolio returns use adjusted prices
   
   # Calculate comprehensive technical factors (exactly as in bridge)
   technical_factors <- price_data %>%
@@ -397,7 +330,7 @@ calculate_complete_technical_factors <- function(price_data, current_date) {
       # ==========================================
       # VOLATILITY FACTORS (8 factors)
       # ==========================================
-      daily_return = close/lag(close) - 1,  # Still use close for volatility calculation
+      daily_return = close/lag(close) - 1,
       tech_vol_5d = rollapply(lag(daily_return, 1), width = 5, FUN = sd, fill = NA, align = "right", na.rm = TRUE),
       tech_vol_10d = rollapply(lag(daily_return, 1), width = 10, FUN = sd, fill = NA, align = "right", na.rm = TRUE),
       tech_vol_21d = rollapply(lag(daily_return, 1), width = 21, FUN = sd, fill = NA, align = "right", na.rm = TRUE),
@@ -532,7 +465,7 @@ calculate_complete_technical_factors <- function(price_data, current_date) {
 }
 
 # ============================================================================
-# MODEL PREPROCESSING (UNCHANGED)
+# MODEL PREPROCESSING (EXACT BRIDGE LOGIC)
 # ============================================================================
 
 apply_enhanced_model_preprocessing <- function(factor_data, enhanced_model) {
@@ -584,7 +517,7 @@ apply_enhanced_model_preprocessing <- function(factor_data, enhanced_model) {
 }
 
 # ============================================================================
-# ENSEMBLE PREDICTIONS (UNCHANGED)
+# ENSEMBLE PREDICTIONS (EXACT BRIDGE LOGIC)
 # ============================================================================
 
 generate_enhanced_ensemble_predictions <- function(processed_data, enhanced_model) {
@@ -605,7 +538,7 @@ generate_enhanced_ensemble_predictions <- function(processed_data, enhanced_mode
 }
 
 # ============================================================================
-# POSITION CREATION (UNCHANGED)
+# POSITION CREATION (EXACT BRIDGE LOGIC)
 # ============================================================================
 
 create_new_slice_positions <- function(complete_data, predictions) {
@@ -630,12 +563,11 @@ create_new_slice_positions <- function(complete_data, predictions) {
 }
 
 # ============================================================================
-# SLICE RETURNS CALCULATION - NOW USES ADJUSTED RETURNS
+# SLICE RETURNS CALCULATION (EXACT BRIDGE LOGIC)
 # ============================================================================
 
 calculate_daily_slice_returns <- function(current_slice_holdings, daily_returns, rebalance_slice, new_positions) {
   
-  # NOTE: daily_returns now contains ADJUSTED returns instead of close returns
   slice_daily_returns <- numeric(21)
   
   for(slice_j in 1:21) {
@@ -672,18 +604,55 @@ calculate_daily_slice_returns <- function(current_slice_holdings, daily_returns,
 }
 
 # ============================================================================
-# UPDATED MAIN OPERATIONAL FUNCTION - NOW USES ADJUSTED RETURNS
+# DAILY RETURNS DATA RETRIEVAL
 # ============================================================================
 
-operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Date(), export_weights = TRUE, export_validation_data = TRUE, output_dir = "output") {
+get_daily_stock_returns <- function(current_date, con, price_table) {
   
-  cat("📈 OPERATIONAL BACKTEST UPDATE WITH ADJUSTED RETURNS\n")
-  cat("===================================================\n")
-  cat("🎯 KEY CHANGE: Now using adjClose for portfolio returns\n")
-  cat("       Technical factors still use close prices for signals\n")
+  # Get previous trading day
+  prev_date_query <- sprintf("
+    SELECT MAX(date) as prev_date 
+    FROM %s 
+    WHERE date < '%s'
+  ", price_table, current_date)
+  
+  prev_date <- dbGetQuery(con, prev_date_query)$prev_date[1]
+  
+  if(is.na(prev_date)) {
+    return(tibble(ticker = character(0), daily_return = numeric(0)))
+  }
+  
+  # Calculate daily returns
+  returns_query <- sprintf("
+    SELECT 
+      curr.ticker,
+      curr.close / prev.close - 1 as daily_return
+    FROM 
+      (SELECT ticker, close FROM %s WHERE date = '%s') curr
+    INNER JOIN 
+      (SELECT ticker, close FROM %s WHERE date = '%s') prev
+    ON curr.ticker = prev.ticker
+    WHERE curr.close IS NOT NULL AND prev.close IS NOT NULL
+      AND prev.close > 0
+  ", price_table, current_date, price_table, prev_date)
+  
+  daily_returns <- dbGetQuery(con, returns_query) %>%
+    select(ticker, daily_return)
+  
+  return(daily_returns)
+}
+
+# ============================================================================
+# COMPLETE OPERATIONAL BACKTEST UPDATE WITH AGGREGATE WEIGHTS
+# ============================================================================
+
+operational_update_backtest_to_latest <- function(target_date = Sys.Date(), export_weights = TRUE, export_validation_data = TRUE, output_dir = "output") {
+  
+  cat("📈 OPERATIONAL BACKTEST UPDATE WITH AGGREGATE WEIGHTS\n")
+  cat("====================================================\n")
   cat("Target date:", as.character(target_date), "\n")
   cat("Export weights:", export_weights, "\n")
-  cat("Export validation data:", export_validation_data, "\n\n")
+  cat("Export validation data:", export_validation_data, "\n")
   
   # Check prerequisites
   if(!exists("enhanced_slice_results_final")) {
@@ -764,15 +733,11 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
   # Try the exact table name used in bridge
   price_table <- "results_pricedata.daily"  # Note the dot, not underscore
   
-  # Test if table exists and has adjClose
+  # Test if table exists
   table_exists <- tryCatch({
-    test_query <- sprintf("SELECT COUNT(*) as count FROM %s WHERE adjClose IS NOT NULL LIMIT 1", price_table)
+    test_query <- sprintf("SELECT COUNT(*) as count FROM %s LIMIT 1", price_table)
     result <- dbGetQuery(con, test_query)
-    if(result$count > 0) {
-      TRUE
-    } else {
-      FALSE
-    }
+    TRUE
   }, error = function(e) {
     FALSE
   })
@@ -782,14 +747,10 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     possible_names <- c("results_pricedata_daily", "pricedata", "daily_prices", "price_data")
     for(name in possible_names) {
       table_exists <- tryCatch({
-        test_query <- sprintf("SELECT COUNT(*) as count FROM %s WHERE adjClose IS NOT NULL LIMIT 1", name)
+        test_query <- sprintf("SELECT COUNT(*) as count FROM %s LIMIT 1", name)
         result <- dbGetQuery(con, test_query)
-        if(result$count > 0) {
-          price_table <- name
-          TRUE
-        } else {
-          FALSE
-        }
+        price_table <- name
+        TRUE
       }, error = function(e) {
         FALSE
       })
@@ -798,19 +759,19 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
   }
   
   if(!table_exists) {
-    cat("❌ No valid price table with adjClose found. Available tables:\n")
+    cat("❌ No valid price table found. Available tables:\n")
     print(available_tables)
     dbDisconnect(con)
     return(NULL)
   }
   
-  cat("✅ Using price table with adjClose:", price_table, "\n")
+  cat("Using price table:", price_table, "\n")
   
   trading_dates_query <- sprintf("
     SELECT DISTINCT date 
     FROM %s 
     WHERE date >= '%s' AND date <= '%s'
-      AND close IS NOT NULL AND adjClose IS NOT NULL
+      AND close IS NOT NULL
     ORDER BY date
   ", price_table, extension_start_date, available_end_date)
   
@@ -827,32 +788,30 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
   cat("Extension date range:", as.character(range(trading_dates)), "\n")
   
   # ============================================================================
-  # MAIN EXTENSION LOOP WITH ADJUSTED RETURNS
+  # MAIN EXTENSION LOOP WITH AGGREGATE WEIGHTS TRACKING
   # ============================================================================
   
-  cat("🚀 Starting operational portfolio extension with ADJUSTED returns...\n")
+  cat("🚀 Starting operational portfolio extension with weight tracking...\n")
   
   for(day_idx in seq_along(trading_dates)) {
     current_date <- trading_dates[day_idx]
     
     if(day_idx %% 5 == 0 || day_idx == length(trading_dates)) {
-      cat("  Day", day_idx, "/", length(trading_dates), "-", as.character(current_date), 
-          "(ADJUSTED returns)\n")
+      cat("  Day", day_idx, "/", length(trading_dates), "-", as.character(current_date), "\n")
     }
     
     # ============================================================================
-    # STEP 1: GET PRICE DATA FOR FACTOR CALCULATION (STILL USES CLOSE)
+    # STEP 1: GET PRICE DATA FOR FACTOR CALCULATION
     # ============================================================================
     
     lookback_date <- current_date - days(400)  # Need 252+ days for long-term factors
     
     price_data_query <- sprintf("
-      SELECT ticker, date, open, high, low, close, volume, adjClose
+      SELECT ticker, date, open, high, low, close, volume
       FROM %s 
       WHERE date >= '%s' AND date <= '%s'
         AND close IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL
-        AND volume IS NOT NULL AND adjClose IS NOT NULL
-        AND close > 1 AND volume > 1000 AND adjClose > 0
+        AND volume IS NOT NULL AND close > 1 AND volume > 1000
       ORDER BY ticker, date
     ", price_table, lookback_date, current_date)
     
@@ -865,7 +824,7 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     }
     
     # ============================================================================
-    # STEP 2: CALCULATE TECHNICAL FACTORS (STILL USES CLOSE)
+    # STEP 2: CALCULATE TECHNICAL FACTORS
     # ============================================================================
     
     factor_data <- calculate_complete_technical_factors(price_data, current_date)
@@ -904,17 +863,17 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     rebalance_slice <- ((extension_day_number - 1) %% 21) + 1
     
     # ============================================================================
-    # STEP 6: CALCULATE ADJUSTED DAILY RETURNS (KEY CHANGE!)
+    # STEP 6: CALCULATE DAILY RETURNS
     # ============================================================================
     
-    daily_returns <- get_daily_stock_returns_adjusted(current_date, con, price_table)
+    daily_returns <- get_daily_stock_returns(current_date, con, price_table)
     
     if(nrow(daily_returns) < 50) {
-      cat("⚠️ Insufficient adjusted return data for", as.character(current_date), "- skipping\n")
+      cat("⚠️ Insufficient return data for", as.character(current_date), "- skipping\n")
       next
     }
     
-    # Calculate slice returns using ADJUSTED returns
+    # Calculate slice returns using exact bridge logic
     slice_daily_returns <- calculate_daily_slice_returns(
       current_slice_holdings, daily_returns, rebalance_slice, new_positions
     )
@@ -923,7 +882,7 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     # STEP 7: UPDATE PORTFOLIO STATE USING EXACT SLICE LOGIC
     # ============================================================================
     
-    # Calculate portfolio return BEFORE updating slice values
+    # Calculate portfolio return BEFORE updating slice values (like slice backtest)
     portfolio_value_before <- sum(current_slice_values)
     
     # Update slice values
@@ -937,9 +896,11 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     current_slice_holdings[[rebalance_slice]] <- new_positions
     
     # ============================================================================
-    # STEP 8: CALCULATE AND STORE DAILY AGGREGATE WEIGHTS
+    # STEP 8: CALCULATE AND STORE DAILY AGGREGATE WEIGHTS (AFTER ALL UPDATES)
     # ============================================================================
     
+    # Calculate aggregate weights AFTER ALL portfolio state updates
+    # These represent the weights going into the next trading day
     day_aggregate_weights <- calculate_aggregate_weights(
       current_slice_values, 
       current_slice_holdings, 
@@ -975,8 +936,7 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
     final_slice_values = current_slice_values,
     final_slice_holdings = current_slice_holdings,
     enhanced_model = enhanced_model,
-    daily_aggregate_weights = daily_aggregate_weights,
-    using_adjusted_returns = TRUE  # Flag to indicate adjusted returns are used
+    daily_aggregate_weights = daily_aggregate_weights  # Complete time series of weights
   )
   
   # Export aggregate weights if requested
@@ -995,12 +955,7 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
   
   if(extension_days > 0) {
     extension_return <- prod(1 + extension_daily_results$portfolio_return) - 1
-    #extension_volatility <- sd(extension_daily_results$portfolio_return, na.rm = TRUE)
-    # Change to:
     extension_volatility <- sd(extension_daily_results$portfolio_return, na.rm = TRUE)
-    if(is.na(extension_volatility) || extension_days == 1) {
-      extension_volatility <- 0  # Can't calculate vol with 1 observation
-    }
     extension_sharpe <- if(extension_volatility > 0) mean(extension_daily_results$portfolio_return, na.rm = TRUE) / extension_volatility * sqrt(252) else 0
     
     # Portfolio composition on latest date
@@ -1013,9 +968,8 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
       net_exposure <- sum(latest_weights$aggregate_weight)
       gross_exposure <- sum(abs(latest_weights$aggregate_weight))
       
-      cat("✅ Operational backtest with ADJUSTED returns completed!\n")
-      cat("========================================================\n")
-      cat("💡 Key improvement: Using adjClose for portfolio returns\n")
+      cat("✅ Operational backtest update completed!\n")
+      cat("========================================\n")
       cat("• Extension days processed:", extension_days, "\n")
       cat("• New end date:", as.character(max(updated_backtest$daily_results$date)), "\n")
       cat("• Total backtest days:", nrow(updated_backtest$daily_results), "\n")
@@ -1031,11 +985,11 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
       cat("• Gross exposure:", sprintf("%.2f%%", gross_exposure * 100), "\n")
       
       if(!is.null(export_files)) {
-        cat("\n📁 Exported files with ADJUSTED returns validation:\n")
+        cat("\n📁 Exported files ready for trading:\n")
         cat("• Latest weights:", basename(export_files$latest_file), "\n")
         cat("• Portfolio summary:", basename(export_files$summary_file), "\n")
-        if(!is.null(export_files$adjusted_validation_file)) {
-          cat("• Adjusted validation (adjusted returns as daily_return):", basename(export_files$adjusted_validation_file), "\n")
+        if(!is.null(export_files$validation_parquet_file)) {
+          cat("• Validation data:", basename(export_files$validation_parquet_file), "\n")
         }
       }
     }
@@ -1050,28 +1004,29 @@ operational_update_backtest_to_latest_adjusted <- function(target_date = Sys.Dat
 # USAGE INSTRUCTIONS
 # ============================================================================
 
-cat("\n✅ COMPLETE OPERATIONAL IMPLEMENTATION WITH ADJUSTED RETURNS READY\n")
-cat("================================================================\n")
-cat("🎯 MAIN FUNCTION (with adjusted returns):\n")
-cat("updated_backtest <- operational_update_backtest_to_latest_adjusted()\n\n")
+cat("\n✅ COMPLETE OPERATIONAL IMPLEMENTATION WITH WEIGHTS READY\n")
+cat("=========================================================\n")
+cat("🎯 MAIN FUNCTION (with weight and validation export):\n")
+cat("updated_backtest <- operational_update_backtest_to_latest()\n\n")
 cat("🎯 DISABLE VALIDATION DATA EXPORT:\n")
-cat("updated_backtest <- operational_update_backtest_to_latest_adjusted(export_validation_data = FALSE)\n\n")
+cat("updated_backtest <- operational_update_backtest_to_latest(export_validation_data = FALSE)\n\n")
+cat("🎯 DISABLE ALL EXPORTS:\n")
+cat("updated_backtest <- operational_update_backtest_to_latest(export_weights = FALSE)\n\n")
 cat("🎯 CUSTOM OUTPUT DIRECTORY:\n")
-cat("updated_backtest <- operational_update_backtest_to_latest_adjusted(output_dir = 'my_weights')\n\n")
-cat("🎯 KEY IMPROVEMENTS:\n")
-cat("• Portfolio returns now use adjClose (dividend-adjusted)\n")
-cat("• Technical factors still use close prices for signal generation\n")
-cat("• Enhanced validation export with BOTH return types\n")
-cat("• Improved Sharpe ratio from dividend adjustments\n")
-cat("• Production-ready with comprehensive return tracking\n\n")
+cat("updated_backtest <- operational_update_backtest_to_latest(output_dir = 'my_weights')\n\n")
+cat("🎯 ACCESS DAILY WEIGHTS:\n")
+cat("daily_weights <- updated_backtest$daily_aggregate_weights\n")
+cat("latest_weights <- daily_weights %>% filter(date == max(date))\n\n")
+cat("🎯 FEATURES:\n")
+cat("• Complete implementation of all 58 technical factors\n")
+cat("• Exact enhanced model preprocessing and prediction\n")
+cat("• FIXED: Exact slice portfolio evolution logic (portfolio value method)\n")
+cat("• Daily aggregate weights calculation and export\n")
+cat("• Portfolio composition analytics\n")
+cat("• Ready-to-trade weight files (CSV format)\n")
+cat("• Production-ready operational system\n\n")
 cat("🎯 OUTPUT FILES:\n")
 cat("• aggregate_weights_YYYYMMDD.csv (latest trading weights)\n")
 cat("• portfolio_summary_YYYYMMDD.csv (portfolio metrics)\n")
 cat("• complete_aggregate_weights_timeseries.csv (full history)\n")
-cat("• weights_with_returns_validation.parquet (close returns - for compatibility)\n")
-cat("• weights_with_adjusted_returns_validation.parquet (adjusted returns as daily_return)\n\n")
-cat("🎯 EXPECTED IMPROVEMENTS:\n")
-cat("• Higher returns from dividend capture\n")
-cat("• Lower volatility from adjusted price smoothing\n")
-cat("• Higher Sharpe ratio overall\n")
-cat("• More accurate portfolio performance attribution\n")
+cat("• weights_with_returns_validation.parquet (validation data with returns)\n")
